@@ -1,266 +1,254 @@
+// WebGL spiral. Same structure as the original engine: Experience owns Sizes, Time, Controls,
+// Camera, Raycaster, Renderer, PostProcessing (edge fade), Resources (one texture per project)
+// and World (two copies of every project as curved planes on a helix).
 import {
-  Color,
-  DataTexture,
-  Vector3,
-  NoToneMapping,
-  PerspectiveCamera,
-  PlaneGeometry,
-  Raycaster,
-  RGBAFormat,
-  Scene,
-  TextureLoader,
-  WebGLRenderer,
-  type Texture,
+  Color, DoubleSide, Mesh, PerspectiveCamera, PlaneGeometry, Raycaster as ThreeRaycaster, Scene,
+  ShaderMaterial, Texture, TextureLoader, Uniform, Vector2, WebGLRenderer, NoToneMapping,
 } from 'three'
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js'
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js'
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js'
-import { CAMERA, HELIX, LOOK, MOTION, SHADER } from './config'
-import { Controls } from './Controls'
-import { ProjectPlane, type HelixProject } from './ProjectPlane'
-import { fadeFragment, fadeVertex } from './shaders'
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js'
+import { planeVertex, planeFragment, fadeVertex, fadeFragment } from './shaders'
 
-/** Raw sRGB components of a hex colour. The shaders work in the image's own colour space, so no linear conversion. */
-function srgbVector(hex: string) {
-  const c = new Color()
-  c.setStyle(hex, 'srgb-linear') // keeps the numbers as written
-  return new Vector3(c.r, c.g, c.b)
+type Project = { title: string; slug: string; thumbnail: string }
+const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v))
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t
+
+class Emitter {
+  private cb: Record<string, Function[]> = {}
+  on(n: string, f: Function) { (this.cb[n] ||= []).push(f); return this }
+  off(n: string) { delete this.cb[n]; return this }
+  trigger(n: string, a: any[] = []) { this.cb[n]?.forEach((f) => f(...a)) }
 }
 
-export interface ExperienceCallbacks {
-  onProgress?: (progress: number) => void
-  onReady?: () => void
-  onHover?: (project: HelixProject | null) => void
-  onOpen?: (project: HelixProject) => void
-}
+export type Hooks = { navigate: (slug: string) => void; play: (sound: string) => void; hover: (p: Project | null) => void; progress?: (l: number, t: number) => void }
 
-/**
- * The whole WebGL home page: renderer, camera, composer, textures, the helix of cards,
- * hover / click picking and the render loop. Created once and kept alive across routes;
- * the page components only call reveal(), hide() and setActive().
- */
-export class Experience {
-  ready = false
-  private sizes = { width: window.innerWidth, height: window.innerHeight, pixelRatio: 1 }
-  private scene = new Scene()
-  private camera: PerspectiveCamera
-  private renderer: WebGLRenderer
-  private composer: EffectComposer
-  private fadePass: ShaderPass
-  private controls: Controls
-  private raycaster = new Raycaster()
-  private geometry = new PlaneGeometry(1, 1, 8, 8)
-  private textures: Texture[] = []
-  private planes: ProjectPlane[] = []
-  private hovered: ProjectPlane | null = null
-  private timers: number[] = []
-  private active = false
-  private rafId = 0
-  private last = performance.now()
-
-  constructor(
-    private canvas: HTMLCanvasElement,
-    private projects: HelixProject[],
-    private callbacks: ExperienceCallbacks = {},
-  ) {
-    this.sizes.pixelRatio = Math.min(window.devicePixelRatio || 1, LOOK.maxPixelRatio)
-
-    this.renderer = new WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance', stencil: false })
-    this.renderer.toneMapping = NoToneMapping
-    this.renderer.setClearColor(0x000000, 0)
-    this.renderer.setSize(this.sizes.width, this.sizes.height, false)
-    this.renderer.setPixelRatio(this.sizes.pixelRatio)
-
-    this.camera = new PerspectiveCamera(this.fov(), this.sizes.width / this.sizes.height, CAMERA.near, CAMERA.far)
-    this.camera.position.set(0, 0, CAMERA.z)
-    this.scene.add(this.camera)
-
-    this.composer = new EffectComposer(this.renderer)
-    this.composer.setPixelRatio(this.sizes.pixelRatio)
-    this.composer.setSize(this.sizes.width, this.sizes.height)
-    this.composer.addPass(new RenderPass(this.scene, this.camera))
-    this.fadePass = new ShaderPass({
-      uniforms: {
-        tDiffuse: { value: null },
-        uFillColor: { value: srgbVector(LOOK.fillColor) },
-        uEdge: { value: SHADER.fadeEdge },
-      },
-      vertexShader: fadeVertex,
-      fragmentShader: fadeFragment,
-    })
-    this.composer.addPass(this.fadePass)
-
-    this.controls = new Controls(canvas, this.sizes, {
-      onClick: () => {
-        if (this.hovered && this.hovered.hidden < 0.01) this.open(this.hovered)
-      },
-      onTap: (x, y) => {
-        this.controls.setPointer(x, y)
-        const plane = this.pick()
-        if (plane) this.open(plane)
-      },
-    })
-
-    this.buildPlanes()
-    this.loadTextures()
-
-    window.addEventListener('resize', this.onResize)
-    this.rafId = requestAnimationFrame(this.tick)
-  }
-
-  private fov() {
-    return this.sizes.width < CAMERA.breakpoint ? CAMERA.fovMobile : CAMERA.fovDesktop
-  }
-
-  /** A 1x1 grey texture so the cards exist before (or if) an image fails to load. */
-  private fallbackTexture() {
-    const t = new DataTexture(new Uint8Array([90, 90, 90, 255]), 1, 1, RGBAFormat)
-    t.needsUpdate = true
-    ;(t as any).image.width = 16
-    ;(t as any).image.height = 9
-    return t
-  }
-
-  private buildPlanes() {
-    const fallback = this.fallbackTexture()
-    this.textures = this.projects.map(() => fallback)
-    const list = Array.from({ length: HELIX.copies }, () => this.projects).flat()
-    list.forEach((project, index) => {
-      const projectIndex = index % this.projects.length
-      const plane = new ProjectPlane(project, projectIndex, index, this.geometry, fallback)
-      this.scene.add(plane.mesh)
-      this.planes.push(plane)
-    })
-  }
-
-  private loadTextures() {
-    const loader = new TextureLoader()
-    let settled = 0
-    const total = this.projects.length
-    const done = () => {
-      settled++
-      this.callbacks.onProgress?.(settled / total)
-      if (settled === total) {
-        this.ready = true
-        this.callbacks.onReady?.()
-      }
-    }
-    this.projects.forEach((project, i) => {
-      loader.load(
-        project.image,
-        (texture) => {
-          texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy())
-          this.textures[i] = texture
-          for (const p of this.planes) if (p.projectIndex === i) p.setTexture(texture)
-          done()
-        },
-        undefined,
-        () => {
-          // A broken image must not block the site (the reference waits forever).
-          console.warn(`[helix] could not load ${project.image}`)
-          done()
-        },
-      )
-    })
-    if (total === 0) {
-      this.ready = true
-      this.callbacks.onReady?.()
-    }
-  }
-
-  /** The card under the pointer, if it faces the camera and is fully shown. */
-  private pick(): ProjectPlane | null {
-    this.raycaster.setFromCamera(this.controls.mouse, this.camera)
-    const hits = this.raycaster.intersectObjects(
-      this.planes.filter((p) => p.mesh.visible).map((p) => p.mesh),
-      false,
-    )
-    const hit = hits[0]
-    if (!hit || !hit.face) return null
-    const plane = hit.object.userData.plane as ProjectPlane
-    const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld)
-    const facing = normal.dot(this.raycaster.ray.direction) < 0
-    return facing && plane.hidden < 0.01 ? plane : null
-  }
-
-  private setHovered(plane: ProjectPlane | null) {
-    if (plane === this.hovered) return
-    if (this.hovered) this.hovered.hoverTarget = 0
-    this.hovered = plane
-    if (plane) plane.hoverTarget = 1
-    this.canvas.style.cursor = plane ? 'pointer' : ''
-    this.callbacks.onHover?.(plane ? plane.project : null)
-  }
-
-  private open(plane: ProjectPlane) {
-    this.setHovered(null)
-    this.hide()
-    this.callbacks.onOpen?.(plane.project)
-  }
-
-  private clearTimers() {
-    this.timers.forEach((t) => clearTimeout(t))
-    this.timers = []
-  }
-
-  /** Cards fall into place in staggered groups of four. */
-  reveal(delay = 0) {
-    this.clearTimers()
-    this.planes.forEach((p, i) => this.timers.push(p.reveal(delay + (i % 4) * MOTION.revealStagger)))
-  }
-
-  /** Cards sink and fade out. */
-  hide() {
-    this.clearTimers()
-    this.setHovered(null)
-    this.planes.forEach((p, i) => this.timers.push(p.hide((i % 4) * MOTION.hideStagger)))
-  }
-
-  /** Active on the home page: input is live. Inactive: input is ignored and rendering stops once the cards are gone. */
-  setActive(active: boolean) {
-    this.active = active
-    this.controls.paused = !active
-    if (!active) this.setHovered(null)
-  }
-
+class Sizes extends Emitter {
+  width = innerWidth; height = innerHeight; pixelRatio = Math.min(devicePixelRatio, 2)
   private onResize = () => {
-    this.sizes.width = window.innerWidth
-    this.sizes.height = window.innerHeight
-    this.sizes.pixelRatio = Math.min(window.devicePixelRatio || 1, LOOK.maxPixelRatio)
-    this.camera.aspect = this.sizes.width / this.sizes.height
-    this.camera.fov = this.fov()
-    this.camera.updateProjectionMatrix()
-    this.renderer.setPixelRatio(this.sizes.pixelRatio)
-    this.renderer.setSize(this.sizes.width, this.sizes.height, false)
-    this.composer.setPixelRatio(this.sizes.pixelRatio)
-    this.composer.setSize(this.sizes.width, this.sizes.height)
+    this.width = innerWidth; this.height = innerHeight; this.pixelRatio = Math.min(devicePixelRatio, 2)
+    this.trigger('resize')
   }
+  constructor() { super(); addEventListener('resize', this.onResize) }
+  destroy() { removeEventListener('resize', this.onResize) }
+}
 
-  private tick = (now: number) => {
-    this.rafId = requestAnimationFrame(this.tick)
-    const dt = Math.min(now - this.last, 50)
-    this.last = now
-
-    const anyVisible = this.planes.some((p) => p.hidden < 0.999 || p.hiddenTarget < 1)
-    if (!this.active && !anyVisible) return // nothing on screen: skip the GPU work
-
-    this.controls.update(dt)
-    if (this.active && this.controls.usingMouse) this.setHovered(this.pick())
-    const count = this.planes.length
-    for (const p of this.planes) p.update(dt, this.controls.offset, this.controls.speed, count)
-    this.composer.render()
+class Time extends Emitter {
+  elapsed = 0; delta = 16; private last = performance.now(); private raf: number | null = null; private running = false
+  constructor() { super(); this.startLoop() }
+  startLoop() { if (this.running) return; this.running = true; this.last = performance.now(); this.loop() }
+  loop = () => {
+    if (!this.running) return
+    const now = performance.now()
+    this.delta = Math.min(now - this.last, 50); this.last = now; this.elapsed += this.delta
+    this.trigger('tick'); this.raf = requestAnimationFrame(this.loop)
   }
+  pause() { this.running = false; if (this.raf !== null) cancelAnimationFrame(this.raf); this.raf = null }
+  resume() { this.startLoop() }
+}
 
-  dispose() {
-    cancelAnimationFrame(this.rafId)
-    this.clearTimers()
-    window.removeEventListener('resize', this.onResize)
-    this.controls.dispose()
-    this.planes.forEach((p) => p.dispose())
-    this.geometry.dispose()
-    new Set(this.textures).forEach((t) => t.dispose())
-    this.fadePass.dispose()
-    this.composer.dispose()
-    this.renderer.dispose()
+// Wheel and horizontal swipe drive an eased, never-quite-stopping scroll offset.
+class Controls extends Emitter {
+  easing = 0.1; wheelDeltaY = 0; targetWheelDeltaY = 0; minWheelSpeed = 0.002; wheelDirection = 1; scrollOffset = 0
+  normalizedMouse = new Vector2(0, 0); isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0; isPaused = false
+  private startX = 0; private lastX = 0; private velocity = 0; private dragging = false
+  constructor(private e: Experience) {
+    super()
+    const c = e.canvas
+    c.addEventListener('wheel', this.onWheel, { passive: true })
+    if (this.isTouchDevice) {
+      c.addEventListener('touchstart', this.onTouchStart, { passive: true })
+      c.addEventListener('touchmove', this.onTouchMove, { passive: false })
+      c.addEventListener('touchend', this.onTouchEnd)
+    } else {
+      c.addEventListener('click', this.onClick)
+      addEventListener('mousemove', this.onMouseMove)
+    }
+  }
+  onWheel = (ev: WheelEvent) => {
+    if (this.isPaused) return
+    this.targetWheelDeltaY = clamp(this.targetWheelDeltaY + ev.deltaY * 15e-5, -2, 2)
+    this.wheelDirection = ev.deltaY > 0 ? 1 : -1
+  }
+  onMouseMove = (ev: MouseEvent) => {
+    if (this.isPaused) return
+    this.normalizedMouse.set((ev.clientX / this.e.sizes.width) * 2 - 1, -(ev.clientY / this.e.sizes.height) * 2 + 1)
+  }
+  onClick = (ev: MouseEvent) => { if (!this.isPaused) this.trigger('click', [ev]) }
+  onTouchStart = (ev: TouchEvent) => {
+    const t = ev.touches[0]
+    if (this.isPaused || !t) return
+    this.startX = this.lastX = t.clientX; this.velocity = 0; this.dragging = false
+  }
+  onTouchMove = (ev: TouchEvent) => {
+    const t = ev.touches[0]
+    if (this.isPaused || !t) return
+    if (!this.dragging && Math.abs(t.clientX - this.startX) > 8) this.dragging = true
+    if (this.dragging) {
+      ev.preventDefault()
+      const m = -(t.clientX - this.lastX) * 0.5
+      this.targetWheelDeltaY = clamp(this.targetWheelDeltaY - m * 0.003, -2, 2)
+      this.wheelDirection = m < 0 ? 1 : -1; this.velocity = m
+    }
+    this.lastX = t.clientX
+  }
+  onTouchEnd = (ev: TouchEvent) => {
+    if (this.isPaused) return
+    if (this.dragging) this.targetWheelDeltaY = clamp(this.targetWheelDeltaY - this.velocity * 0.002, -2, 2)
+    else this.trigger('tap', [ev])
+    this.dragging = false; this.velocity = 0
+  }
+  update() {
+    this.wheelDeltaY += (this.targetWheelDeltaY - this.wheelDeltaY) * this.easing
+    this.scrollOffset += this.wheelDeltaY
+    if (Math.abs(this.targetWheelDeltaY) < this.minWheelSpeed) this.targetWheelDeltaY = this.wheelDirection * this.minWheelSpeed
+    this.targetWheelDeltaY *= 0.9
+  }
+  destroy() {
+    const c = this.e.canvas
+    c.removeEventListener('wheel', this.onWheel); c.removeEventListener('click', this.onClick)
+    removeEventListener('mousemove', this.onMouseMove)
+    c.removeEventListener('touchstart', this.onTouchStart); c.removeEventListener('touchmove', this.onTouchMove); c.removeEventListener('touchend', this.onTouchEnd)
+  }
+}
+
+export class Logics {
+  hasEntered = false; menuOpened = false
+  toggleMenu(v: boolean | null = null) { this.menuOpened = v === null ? !this.menuOpened : v }
+}
+
+class ProjectPlane extends Mesh<PlaneGeometry, ShaderMaterial> {
+  isHovered = false; hoverProgress = 0; hoverTarget = 0; isHidden = true; hiddenProgress = 1; hiddenTarget = 1
+  verticalGap = 0.5; angleGap = 0.85; baseRadius = 2; centerIndex: number
+  constructor(private e: Experience, public index: number, public project: Project, private count: number, geo: PlaneGeometry) {
+    super(geo)
+    this.centerIndex = Math.floor(count / 2)
+    this.scale.set(1.7, 1, 1)
+    const tex = e.textures[project.slug]!
+    this.material = new ShaderMaterial({
+      uniforms: {
+        uTexture: new Uniform(tex), uColorStrength: new Uniform(0), uZoom: new Uniform(1),
+        uPlaneSizes: new Uniform(new Vector2(1.7, 1)), uImageSizes: new Uniform(new Vector2(tex.image.width, tex.image.height)),
+        uRevealProgress: new Uniform(0), uScrollSpeed: new Uniform(0),
+      },
+      vertexShader: planeVertex, fragmentShader: planeFragment, transparent: true, side: DoubleSide,
+    })
+    e.scene.add(this); this.update()
+  }
+  reveal() { this.isHidden = false; this.hiddenTarget = 0 }
+  hide() { this.isHidden = true; this.hiddenTarget = 1 }
+  setHovered(v: boolean) { this.isHovered = v; this.hoverTarget = v ? 1 : 0 }
+  update() {
+    const dt = this.e.time.delta, c = this.e.controls
+    const dir = this.isHidden ? 1.5 : -1.5
+    this.hoverProgress = lerp(this.hoverProgress, this.hoverTarget, 1 - Math.pow(1 - (this.isHovered ? 0.09 : 0.07), dt * 0.2))
+    this.hiddenProgress = lerp(this.hiddenProgress, this.hiddenTarget, 1 - Math.pow(0.95, dt * 0.15))
+    let n = this.index - c.scrollOffset
+    n = ((n % this.count) + this.count) % this.count
+    const k = n - this.centerIndex
+    const y = k * this.verticalGap - 0.8 - this.hiddenProgress * dir
+    const r = this.baseRadius * (1 - this.hiddenProgress / 2)
+    const a = k * this.angleGap
+    this.position.set(Math.cos(a) * r, y, Math.sin(a) * r)
+    this.rotation.y = -a + Math.PI / 2
+    const u = this.material.uniforms
+    u.uColorStrength!.value = 0.55 * this.hoverProgress
+    u.uZoom!.value = 1 + 0.05 * this.hoverProgress
+    u.uRevealProgress!.value = (1 - this.hoverProgress * 0.05) * (1 - this.hiddenProgress)
+    u.uScrollSpeed!.value = c.wheelDeltaY
+  }
+}
+
+class World {
+  planes: ProjectPlane[] = []; hovered: ProjectPlane | null = null
+  constructor(private e: Experience, projects: Project[]) {
+    const geo = new PlaneGeometry(1, 1, 8, 8), count = projects.length * 2
+    ;[...projects, ...projects].forEach((p, i) => this.planes.push(new ProjectPlane(e, i, p, count, geo)))
+    e.controls.on('click', () => {
+      if (this.hovered && this.hovered.hiddenProgress < 0.01 && e.isActive) {
+        e.canvas.style.cursor = 'default'; e.hooks.play('longclick'); e.hooks.navigate(this.hovered.project.slug); this.hideProjects()
+      }
+    })
+    e.controls.on('tap', (ev: TouchEvent) => {
+      if (!e.isActive || e.logics.menuOpened) return
+      const p = this.tapped(ev)
+      if (p) { e.hooks.play('longclick'); e.hooks.navigate(p.project.slug); this.hideProjects() }
+    })
+  }
+  private frontHit() {
+    const hit = this.e.raycaster.intersectObjects(this.planes)[0]
+    if (!hit) return null
+    const front = hit.face!.normal.clone().transformDirection(hit.object.matrixWorld).dot(this.e.raycaster.ray.direction) < 0
+    return { plane: hit.object as ProjectPlane, front }
+  }
+  private tapped(ev: TouchEvent) {
+    const t = ev.changedTouches[0]
+    if (!t) return null
+    this.e.controls.normalizedMouse.set((t.clientX / this.e.sizes.width) * 2 - 1, -(t.clientY / this.e.sizes.height) * 2 + 1)
+    this.e.raycaster.setFromCamera(this.e.controls.normalizedMouse, this.e.camera)
+    const h = this.frontHit()
+    return h && h.front && h.plane.hiddenProgress < 0.01 ? h.plane : null
+  }
+  private clearHover() {
+    this.e.canvas.style.cursor = 'default'; this.hovered?.setHovered(false); this.hovered = null; this.e.hooks.hover(null)
+  }
+  checkHovered() {
+    if (this.e.controls.isTouchDevice || this.e.logics.menuOpened) return
+    const h = this.frontHit()
+    if (!h) return this.clearHover()
+    if (this.hovered === h.plane) return
+    this.hovered?.setHovered(false)
+    if (h.front && !h.plane.isHovered && h.plane.hiddenProgress < 0.01 && this.e.isActive) {
+      this.hovered = h.plane; h.plane.setHovered(true); this.e.canvas.style.cursor = 'pointer'
+      this.e.hooks.play('hover'); this.e.hooks.hover(h.plane.project)
+    } else this.clearHover()
+  }
+  hideProjects() { this.planes.forEach((p, i) => setTimeout(() => p.hide(), (i % 4) * 30)) }
+  revealProjects() { this.e.resume(); this.planes.forEach((p, i) => setTimeout(() => p.reveal(), (i % 4) * 50)) }
+  update() { this.checkHovered(); this.planes.forEach((p) => p.update()) }
+}
+
+export class Experience {
+  isActive = true
+  sizes = new Sizes(); time = new Time(); scene = new Scene(); logics = new Logics()
+  controls: Controls; camera: PerspectiveCamera; raycaster = new ThreeRaycaster(); renderer: WebGLRenderer; composer: EffectComposer
+  textures: Record<string, Texture> = {}; world?: World
+  constructor(public canvas: HTMLCanvasElement, projects: Project[], public hooks: Hooks) {
+    this.controls = new Controls(this)
+    const s = this.sizes
+    this.camera = new PerspectiveCamera(s.width < 900 ? 45 : 35, s.width / s.height, 0.1, 100)
+    this.camera.position.set(0, 0, 8); this.scene.add(this.camera)
+    this.renderer = new WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance', stencil: false })
+    this.renderer.toneMapping = NoToneMapping; this.renderer.setClearColor(0x0e0e0e, 0)
+    this.renderer.setSize(s.width, s.height); this.renderer.setPixelRatio(s.pixelRatio)
+    const fade = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uFillColor: { value: new Color('#444') } }, vertexShader: fadeVertex, fragmentShader: fadeFragment })
+    this.composer = new EffectComposer(this.renderer)
+    this.composer.addPass(new RenderPass(this.scene, this.camera)); this.composer.addPass(fade)
+    // Resources: one 512px texture per project thumbnail; World is built when all are loaded.
+    const loader = new TextureLoader(); let loaded = 0
+    projects.forEach((p) => loader.load(p.thumbnail, (t) => {
+      this.textures[p.slug] = t; loaded++; hooks.progress?.(loaded, projects.length)
+      if (loaded === projects.length) this.world = new World(this, projects)
+    }))
+    s.on('resize', () => this.resize()); this.time.on('tick', () => this.update())
+  }
+  resize() {
+    const s = this.sizes
+    this.camera.aspect = s.width / s.height; this.camera.fov = s.width < 900 ? 45 : 35; this.camera.updateProjectionMatrix()
+    this.renderer.setSize(s.width, s.height); this.renderer.setPixelRatio(s.pixelRatio)
+    this.composer.setSize(s.width, s.height); this.composer.setPixelRatio(s.pixelRatio)
+  }
+  pause() { if (!this.isActive) return; this.isActive = false; this.time.pause(); this.controls.isPaused = true }
+  resume() { if (this.isActive) return; this.isActive = true; this.time.resume(); this.controls.isPaused = false }
+  update() {
+    if (!this.isActive) return
+    this.raycaster.setFromCamera(this.controls.normalizedMouse, this.camera)
+    this.controls.update(); this.composer.render(); this.world?.update()
+  }
+  destroy() {
+    this.sizes.destroy(); this.time.pause(); this.controls.destroy()
+    Object.values(this.textures).forEach((t) => t.dispose())
+    this.scene.traverse((m) => { if (m instanceof Mesh) { m.geometry.dispose(); m.material.dispose() } })
+    this.composer.dispose(); this.renderer.dispose(); this.renderer.forceContextLoss()
   }
 }

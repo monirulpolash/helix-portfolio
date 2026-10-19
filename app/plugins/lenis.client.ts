@@ -1,22 +1,24 @@
 import Lenis from 'lenis'
-import 'lenis/dist/lenis.css'
+import gsap from 'gsap'
+import { ScrollTrigger } from 'gsap/ScrollTrigger'
 
-/**
- * Smooth scrolling for the regular pages (project, about), like the reference.
- * The home page has no page scroll: its helix uses the custom controller in experience/Controls.ts.
- */
-export default defineNuxtPlugin((nuxtApp) => {
-  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  const lenis = reduced ? null : new Lenis({ autoRaf: true, lerp: 0.1, smoothWheel: true })
-
-  const router = useRouter()
-  router.afterEach(() => {
-    lenis?.scrollTo(0, { immediate: true, force: true })
+// Smooth scroll with the original's settings, driven by the GSAP ticker and synced to ScrollTrigger.
+export default defineNuxtPlugin((nuxt) => {
+  const lenis = new Lenis({
+    wheelMultiplier: 0.8, infinite: false, gestureOrientation: 'vertical', duration: 1.2,
+    easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)), autoRaf: false, autoResize: true,
   })
-
-  nuxtApp.hook('page:finish', () => {
-    lenis?.resize()
+  gsap.registerPlugin(ScrollTrigger)
+  let last = 0
+  lenis.on('scroll', ({ scroll }: { scroll: number }) => {
+    const dir = scroll > last ? 'down' : scroll < last ? 'up' : 'still'
+    last = scroll
+    ScrollTrigger.update()
+    document.body.setAttribute('data-scroll', scroll === 0 ? 'top' : dir)
   })
-
+  gsap.ticker.add((t) => lenis.raf(t * 1000))
+  gsap.ticker.lagSmoothing(0)
+  addEventListener('resize', () => ScrollTrigger.refresh())
+  nuxt.hook('page:finish', () => ScrollTrigger.refresh())
   return { provide: { lenis } }
 })
