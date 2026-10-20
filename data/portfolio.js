@@ -21,6 +21,8 @@ export const projects = palettes.map((colors, i) => {
     behanceUrl: 'https://www.behance.net/',
     colors,
     thumbnail: `/media/${slug}/thumb.jpg`,
+    // small copy for the spiral hover label (48px on screen); leave it out to fall back to thumbnail
+    thumbnailSmall: `/media/${slug}/thumb-s.jpg`,
     video: slug,
     styleframes: Array.from({ length: 6 }, (_, k) => `/media/${slug}/sf-${k + 1}.jpg`),
   }

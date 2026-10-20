@@ -4,8 +4,22 @@
 // fades with "project-fade". The original listens to the experience's "hoverProject" event;
 // here Experience.ts calls hooks.hover(project | null), which sets
 // useExperienceStore().hoveredProject. Mouse devices only (pages/index.vue checks hover).
+//
+// Original behaviour (pacomepertant.com, checked again Oct 20): the label is a white pill fixed
+// 60px above the bottom edge, centred; 6/16/6/6 padding, 14px radius, 48px thumbnail with 9px
+// radius, 12px gap, title 18px weight 500. It enters with "project-fade" (from opacity 0,
+// translateY(18px) scale(.96), 0.35s cubic-bezier(.22,1,.36,1)) and leaves upwards (to
+// translateY(-12px) scale(.96), 0.25s). Moving straight from one card to the next only swaps the
+// thumbnail and title; crossing a gap between cards replays the pop.
+// The original loads a 64px-wide thumbnail for this; the small file here is thumbnailSmall
+// (128px, sharp on retina), preloaded once so the pill never pops in without its image.
 const experienceStore = useExperienceStore()
+const content = useContentStore()
 const project = computed(() => experienceStore.hoveredProject)
+const thumb = (p: any) => p.thumbnailSmall || p.thumbnail
+onMounted(() => {
+  for (const p of content.projects || []) { const i = new Image(); i.decoding = 'async'; i.src = thumb(p) }
+})
 onBeforeUnmount(() => { experienceStore.hoveredProject = null })
 </script>
 
@@ -14,7 +28,7 @@ onBeforeUnmount(() => { experienceStore.hoveredProject = null })
     <div v-if="project" class="wrapper">
       <div class="content">
         <div class="infos">
-          <img :src="project.thumbnail" :alt="`${project.title} thumbnail image`">
+          <img :src="thumb(project)" :alt="`${project.title} thumbnail image`" width="48" height="48">
           <h4>{{ project.title }}</h4>
         </div>
       </div>

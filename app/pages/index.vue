@@ -12,7 +12,9 @@ definePageMeta({
   },
 })
 
-const { hover } = useBreakpoint()
+// the original mounts ProjectHover for '(hover: hover) and (pointer: fine)' only; a device
+// that also has a mouse or trackpad (touchscreen laptop) gets it too
+const { hover, anyHover } = useBreakpoint()
 </script>
 
 <template>
@@ -20,7 +22,7 @@ const { hover } = useBreakpoint()
     <Loader />
     <ProjectList />
     <ClientOnly>
-      <ProjectHover v-if="hover" />
+      <ProjectHover v-if="hover || anyHover" />
     </ClientOnly>
   </main>
 </template>

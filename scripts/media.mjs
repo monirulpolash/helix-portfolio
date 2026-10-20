@@ -35,6 +35,7 @@ function video(id, colors, seed, dur) {
 portfolio.projects.forEach((p, i) => {
   const d = dir(p.slug)
   still(`${d}/thumb.jpg`, grad('1280x800', p.colors, i + 3))
+  if (!existsSync(`${d}/thumb-s.jpg`)) run(['-i', `${d}/thumb.jpg`, '-vf', 'scale=-2:128', '-q:v', '4', `${d}/thumb-s.jpg`])
   still(`${OUT}/og-${p.slug}.jpg`, grad('1200x630', p.colors, i + 3))
   p.styleframes.forEach((_, k) => {
     const src = k % 3 === 2 ? `mandelbrot=s=1920x1080:start_scale=${1 + k}:end_pts=${k}` : grad('1920x1080', [p.colors[k % 2], p.colors[(k + 1) % 2]], i * 10 + k)
