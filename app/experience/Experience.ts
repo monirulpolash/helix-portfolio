@@ -51,6 +51,11 @@ class Time extends Emitter {
 class Controls extends Emitter {
   easing = 0.1; wheelDeltaY = 0; targetWheelDeltaY = 0; minWheelSpeed = 0.002; wheelDirection = 1; scrollOffset = 0
   normalizedMouse = new Vector2(0, 0); isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0; isPaused = false
+  // Added to the original: a laptop with a touchscreen also has a mouse or trackpad. The original
+  // turned hover (and click) off on any touch-capable device; here the mouse keeps working there,
+  // and the hover label only reacts to a real mouse pointer, never to a finger.
+  hasMouse = !this.isTouchDevice || matchMedia('(any-pointer: fine)').matches
+  lastPointer: 'mouse' | 'touch' = this.isTouchDevice && !matchMedia('(pointer: fine)').matches ? 'touch' : 'mouse'
   private startX = 0; private lastX = 0; private velocity = 0; private dragging = false
   constructor(private e: Experience) {
     super()
@@ -60,9 +65,10 @@ class Controls extends Emitter {
       c.addEventListener('touchstart', this.onTouchStart, { passive: true })
       c.addEventListener('touchmove', this.onTouchMove, { passive: false })
       c.addEventListener('touchend', this.onTouchEnd)
-    } else {
+    }
+    if (this.hasMouse) {
       c.addEventListener('click', this.onClick)
-      addEventListener('mousemove', this.onMouseMove)
+      addEventListener('pointermove', this.onMouseMove)
     }
   }
   onWheel = (ev: WheelEvent) => {
@@ -70,13 +76,17 @@ class Controls extends Emitter {
     this.targetWheelDeltaY = clamp(this.targetWheelDeltaY + ev.deltaY * 15e-5, -2, 2)
     this.wheelDirection = ev.deltaY > 0 ? 1 : -1
   }
-  onMouseMove = (ev: MouseEvent) => {
+  onMouseMove = (ev: PointerEvent) => {
+    if (ev.pointerType && ev.pointerType !== 'mouse') return
+    this.lastPointer = 'mouse'
     if (this.isPaused) return
     this.normalizedMouse.set((ev.clientX / this.e.sizes.width) * 2 - 1, -(ev.clientY / this.e.sizes.height) * 2 + 1)
   }
-  onClick = (ev: MouseEvent) => { if (!this.isPaused) this.trigger('click', [ev]) }
+  // a tap on a touchscreen also sends a click: the tap handler already navigated then
+  onClick = (ev: MouseEvent) => { if (!this.isPaused && this.lastPointer === 'mouse') this.trigger('click', [ev]) }
   onTouchStart = (ev: TouchEvent) => {
     const t = ev.touches[0]
+    this.lastPointer = 'touch'
     if (this.isPaused || !t) return
     this.startX = this.lastX = t.clientX; this.velocity = 0; this.dragging = false
   }
@@ -107,7 +117,7 @@ class Controls extends Emitter {
   destroy() {
     const c = this.e.canvas
     c.removeEventListener('wheel', this.onWheel); c.removeEventListener('click', this.onClick)
-    removeEventListener('mousemove', this.onMouseMove)
+    removeEventListener('pointermove', this.onMouseMove)
     c.removeEventListener('touchstart', this.onTouchStart); c.removeEventListener('touchmove', this.onTouchMove); c.removeEventListener('touchend', this.onTouchEnd)
   }
 }
@@ -193,7 +203,9 @@ class World {
     this.e.canvas.style.cursor = 'default'; this.hovered?.setHovered(false); this.hovered = null; this.e.hooks.hover(null)
   }
   checkHovered() {
-    if (this.e.controls.isTouchDevice || this.e.logics.menuOpened) return
+    const c = this.e.controls
+    if (!c.hasMouse || this.e.logics.menuOpened) return
+    if (c.lastPointer === 'touch') { if (this.hovered) this.clearHover(); return }
     const h = this.frontHit()
     if (!h) return this.clearHover()
     if (this.hovered === h.plane) return
